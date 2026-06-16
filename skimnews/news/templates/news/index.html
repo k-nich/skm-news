@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SKIM NEWS — the five-minute paper</title>
+
+<!-- ===================================================================
+     CONTENT IS DATABASE-DRIVEN.
+     Edit stories and sections through the Django admin at /admin/.
+     The view (news/views.py) loads them and injects them below as JSON
+     into <script id="edition-data">, which the renderer reads. You don't
+     edit content in this file anymore — only layout/styling lives here.
+     ==================================================================== -->
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --paper:#F5F4EF;        /* newsprint, cool-neutral (not cream) */
+    --paper-2:#EFEDE6;      /* faint panel tint */
+    --ink:#161410;          /* near-black */
+    --sub:#736F65;          /* captions, secondary bullet text */
+    --rule:#CBC8BE;         /* hairlines */
+    --rule-strong:#161410;  /* heavy masthead rules */
+    --accent:#B4291F;       /* press red — used with restraint */
+    --skimmed:#A7A39A;       /* dimmed read state */
+
+    --serif:'Fraunces',Georgia,serif;
+    --sans:'Archivo',system-ui,sans-serif;
+    --mono:'Spline Sans Mono',ui-monospace,monospace;
+  }
+
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--sans);
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:0 22px 80px;}
+
+  /* ---------- MASTHEAD ---------- */
+  .masthead{padding-top:26px;}
+  .topline{
+    display:flex;justify-content:space-between;align-items:flex-end;
+    gap:16px;font-family:var(--mono);font-size:.72rem;
+    letter-spacing:.06em;text-transform:uppercase;color:var(--sub);
+    padding-bottom:10px;
+  }
+  .topline .edition{color:var(--ink);}
+  .nameplate{
+    text-align:center;
+    border-top:3px solid var(--rule-strong);
+    border-bottom:1px solid var(--rule-strong);
+    padding:14px 0 10px;
+  }
+  .nameplate h1{
+    font-family:var(--serif);
+    font-weight:700;
+    font-size:clamp(3rem,11vw,6.4rem);
+    line-height:.9;
+    margin:0;
+    letter-spacing:.01em;
+  }
+  .nameplate .tag{
+    font-family:var(--mono);
+    font-size:.74rem;letter-spacing:.34em;text-transform:uppercase;
+    color:var(--accent);margin-top:8px;
+  }
+
+  /* ---------- READ METER (signature) ---------- */
+  .meter{
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    border-bottom:1px solid var(--rule-strong);
+    padding:11px 2px 12px;
+    font-family:var(--mono);font-size:.74rem;
+    letter-spacing:.03em;text-transform:uppercase;color:var(--sub);
+  }
+  .meter b{color:var(--ink);font-weight:600;}
+  .meter .accent{color:var(--accent);}
+  .bar{
+    flex:1 1 160px;min-width:120px;height:8px;
+    background:var(--paper-2);
+    border:1px solid var(--rule);
+    position:relative;overflow:hidden;
+  }
+  .bar > i{
+    position:absolute;inset:0;width:0%;
+    background:var(--ink);
+    transition:width .35s ease;
+  }
+  .reset{
+    font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--sub);background:none;border:none;
+    cursor:pointer;padding:4px 2px;text-decoration:underline;
+    text-underline-offset:3px;
+  }
+  .reset:hover{color:var(--accent);}
+
+  /* ---------- LEAD ---------- */
+  .lead{
+    display:grid;grid-template-columns:1fr 1fr;gap:0;
+    border-bottom:2px solid var(--rule-strong);
+  }
+  .lead .story{padding:22px 26px 26px;}
+  .lead .story:first-child{
+    border-right:1px solid var(--rule);
+  }
+  .lead .headline{font-size:clamp(1.5rem,3.2vw,2.35rem);line-height:1.04;}
+
+  /* ---------- SECTION GRID ---------- */
+  .sections{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:0;
+  }
+  .col{
+    padding:18px 20px 8px;
+    border-right:1px solid var(--rule);
+  }
+  .col:nth-child(3n){border-right:none;}
+  .col:not(:nth-child(-n+3)){border-top:1px solid var(--rule);}
+
+  .col-head{
+    font-family:var(--mono);
+    font-size:.74rem;font-weight:600;letter-spacing:.16em;
+    text-transform:uppercase;
+    padding-bottom:8px;margin-bottom:14px;
+    border-bottom:2px solid var(--rule-strong);
+    display:flex;justify-content:space-between;align-items:baseline;
+  }
+  .col-head .count{color:var(--sub);font-weight:400;letter-spacing:.06em;}
+
+  /* ---------- STORY UNIT ---------- */
+  .story{
+    position:relative;
+    padding:14px 0 16px;
+    border-top:1px solid var(--rule);
+    cursor:pointer;
+    transition:opacity .25s ease;
+  }
+  .col .story:first-of-type{border-top:none;padding-top:0;}
+  .story:focus-visible{outline:2px solid var(--accent);outline-offset:4px;}
+
+  .kicker{
+    font-family:var(--mono);
+    font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--accent);
+    display:flex;align-items:center;gap:8px;margin-bottom:6px;
+  }
+  .kicker .secs{color:var(--sub);}
+  .kicker .live{
+    display:inline-flex;align-items:center;gap:5px;color:var(--accent);
+  }
+  .kicker .live::before{
+    content:"";width:7px;height:7px;border-radius:50%;
+    background:var(--accent);animation:pulse 1.6s infinite;
+  }
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.25;}}
+
+  .headline{
+    font-family:var(--serif);font-weight:600;
+    font-size:1.12rem;line-height:1.14;margin:0 0 8px;
+  }
+  .lead .story:first-child .headline{font-weight:700;}
+
+  ul.bullets{margin:0;padding:0;list-style:none;}
+  ul.bullets li{
+    position:relative;padding-left:15px;
+    font-size:.9rem;color:#2b2924;margin-bottom:4px;line-height:1.4;
+  }
+  ul.bullets li::before{
+    content:"";position:absolute;left:0;top:.55em;
+    width:5px;height:5px;background:var(--accent);
+  }
+
+  /* skimmed state */
+  .check{
+    position:absolute;top:14px;right:0;
+    font-family:var(--mono);font-size:.62rem;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--skimmed);
+    opacity:0;transition:opacity .2s ease;
+  }
+  .col .story:first-of-type .check{top:0;}
+  .story.done{opacity:.46;}
+  .story.done .kicker{color:var(--skimmed);}
+  .story.done ul.bullets li::before{background:var(--skimmed);}
+  .story.done .headline{text-decoration:line-through;text-decoration-color:var(--rule);}
+  .story.done .check{opacity:1;color:var(--ink);}
+  .story:hover .headline{text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px;}
+  .story.done:hover .headline{text-decoration-line:line-through underline;}
+
+  footer{
+    margin-top:30px;padding-top:14px;
+    border-top:3px solid var(--rule-strong);
+    font-family:var(--mono);font-size:.7rem;letter-spacing:.05em;
+    text-transform:uppercase;color:var(--sub);
+    display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;
+  }
+
+  /* ---------- RESPONSIVE ---------- */
+  @media(max-width:820px){
+    .sections{grid-template-columns:repeat(2,1fr);}
+    .col:nth-child(3n){border-right:1px solid var(--rule);}
+    .col:nth-child(2n){border-right:none;}
+    .col:not(:nth-child(-n+2)){border-top:1px solid var(--rule);}
+    .col:nth-child(-n+3){} /* reset desktop rule */
+  }
+  @media(max-width:560px){
+    .wrap{padding:0 16px 60px;}
+    .lead{grid-template-columns:1fr;}
+    .lead .story:first-child{border-right:none;border-bottom:1px solid var(--rule);}
+    .sections{grid-template-columns:1fr;}
+    .col{border-right:none !important;border-top:1px solid var(--rule);}
+    .col:first-child{border-top:none;}
+    .topline{font-size:.66rem;}
+  }
+  @media(prefers-reduced-motion:reduce){
+    *{animation:none !important;transition:none !important;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="topline">
+      <span class="edition" id="dateline">—</span>
+      <span>No. 001 · Free</span>
+    </div>
+    <div class="nameplate">
+      <h1 id="nameplate-title">SKIM NEWS</h1>
+      <div class="tag" id="nameplate-tag">the five-minute paper</div>
+    </div>
+    <div class="meter">
+      <span><b id="scan-time">—</b> to scan</span>
+      <span><b id="story-count">—</b> stories</span>
+      <span class="accent"><b id="skim-count">0</b> skimmed</span>
+      <div class="bar"><i id="bar-fill"></i></div>
+      <button class="reset" id="reset-btn" type="button">reset</button>
+    </div>
+  </header>
+
+  <section class="lead" id="lead"></section>
+  <section class="sections" id="sections"></section>
+
+  <footer>
+    <span>SKIM NEWS · made for the scan</span>
+    <span id="foot-date">—</span>
+  </footer>
+
+</div>
+
+{{ edition|json_script:"edition-data" }}
+<script>
+const EDITION = JSON.parse(document.getElementById("edition-data").textContent);
+
+
+/* ---- rendering + skim mechanics (no need to edit below) ---- */
+(function(){
+  const fmtDate = new Date().toLocaleDateString('en-AU',
+    {weekday:'long', day:'numeric', month:'long', year:'numeric'});
+  document.getElementById('dateline').textContent = fmtDate;
+  document.getElementById('foot-date').textContent = fmtDate;
+  document.getElementById('nameplate-title').textContent = EDITION.masthead.name;
+  document.getElementById('nameplate-tag').textContent = EDITION.masthead.tagline;
+
+  let allStories = [];
+
+  function storyEl(s){
+    const el = document.createElement('article');
+    el.className = 'story';
+    el.tabIndex = 0;
+    el.setAttribute('role','button');
+    el.setAttribute('aria-pressed','false');
+
+    const live = s.breaking ? '<span class="live">Breaking</span>' : '';
+    const secs = s.secs ? `<span class="secs">${s.secs}s</span>` : '';
+    el.innerHTML = `
+      <div class="kicker">${live || (s.kicker||'')} ${secs}</div>
+      <h3 class="headline">${s.headline||''}</h3>
+      <ul class="bullets">${(s.bullets||[]).map(b=>`<li>${b}</li>`).join('')}</ul>
+      <span class="check">✓ skimmed</span>`;
+
+    el.addEventListener('click', ()=> toggle(el));
+    el.addEventListener('keydown', e=>{
+      if(e.key===' '||e.key==='Enter'){ e.preventDefault(); toggle(el); }
+    });
+    allStories.push(el);
+    return el;
+  }
+
+  function toggle(el){
+    el.classList.toggle('done');
+    el.setAttribute('aria-pressed', el.classList.contains('done'));
+    updateMeter();
+  }
+
+  // lead
+  const leadWrap = document.getElementById('lead');
+  EDITION.lead.forEach(s=> leadWrap.appendChild(storyEl(s)));
+
+  // sections
+  const secWrap = document.getElementById('sections');
+  EDITION.sections.forEach(sec=>{
+    const col = document.createElement('div');
+    col.className = 'col';
+    const head = document.createElement('div');
+    head.className = 'col-head';
+    head.innerHTML = `<span>${sec.name}</span><span class="count">${sec.stories.length}</span>`;
+    col.appendChild(head);
+    sec.stories.forEach(s=> col.appendChild(storyEl(s)));
+    secWrap.appendChild(col);
+  });
+
+  // meter
+  const totalSecs = allStories.length
+    ? [...EDITION.lead, ...EDITION.sections.flatMap(s=>s.stories)]
+        .reduce((a,s)=> a + (s.secs||20), 0)
+    : 0;
+  const mins = Math.max(1, Math.round(totalSecs/60));
+  document.getElementById('scan-time').textContent = `~${mins} min`;
+  document.getElementById('story-count').textContent = allStories.length;
+
+  function updateMeter(){
+    const done = allStories.filter(e=>e.classList.contains('done')).length;
+    document.getElementById('skim-count').textContent = done;
+    document.getElementById('bar-fill').style.width =
+      (allStories.length ? (done/allStories.length*100) : 0) + '%';
+  }
+  document.getElementById('reset-btn').addEventListener('click', ()=>{
+    allStories.forEach(e=>{e.classList.remove('done');e.setAttribute('aria-pressed','false');});
+    updateMeter();
+  });
+
+  updateMeter();
+})();
+</script>
+</body>
+</html>
