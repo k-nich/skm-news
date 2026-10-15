@@ -24,6 +24,7 @@ from .admin import MAX_DRAFTS_PER_ACTION
 from .drafts import PLACEHOLDER, split_bullets
 from .ingest import LOCK_KEY, ParseError, clean_text, link_key, parse, run
 from .models import Feed, FeedItem
+from .validators import normalise_feed_url
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=dt_timezone.utc)
 REAL_ADDRESS_POLICY = ingest._address_allowed
@@ -602,6 +603,21 @@ class IngestTests(ServerTestCase):
             call_command("ingest_feeds", "--force", stdout=StringIO())
         with self.assertRaisesMessage(CommandError, "No feed with id 999"):
             call_command("ingest_feeds", "--feed", "999", stdout=StringIO())
+
+
+class SeedTests(TestCase):
+    def test_seeded_feeds_are_valid_and_sectioned(self):
+        feeds = Feed.objects.select_related("section")
+        self.assertEqual(feeds.count(), 20)
+        for feed in feeds:
+            with self.subTest(feed=feed.name):
+                self.assertEqual(feed.url, normalise_feed_url(feed.url))
+                feed.full_clean()  # URL validators, incl. the public-address check
+        bbc = feeds.filter(url__startswith="https://feeds.bbci.co.uk/")
+        self.assertEqual(
+            sorted(str(f.section or "-") for f in bbc),
+            ["-", "Business", "Culture", "Science", "Sport", "Tech", "World"],
+        )
 
 
 # Admin pages reference static files; the manifest only exists after collectstatic.

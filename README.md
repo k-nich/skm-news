@@ -80,9 +80,9 @@ Public news feeds are pulled into a read-only **wire** in the admin
   fetch interval. Health columns show last status, consecutive failures and
   the next due time. "Fetch on the next scheduled run" clears a feed's wait
   and backoff; changing a feed's URL does the same. Fetching only happens in
-  the cron service, never in a web request. Thirteen public-broadcaster feeds
-  (ABC, SBS, RNZ, NPR) are seeded by `feeds/migrations/0002_seed_feeds.py`,
-  mapped to sections by name.
+  the cron service, never in a web request. Twenty public-broadcaster feeds
+  are seeded and mapped to sections by name: ABC, SBS, RNZ and NPR in
+  `feeds/migrations/0002_seed_feeds.py`, BBC in `0003_seed_bbc_feeds.py`.
 - **Feed items** (Journalist, Editor, Admin): filter by status, section or
   feed, open the original, then select up to 25 items and run "Create draft
   stories from selected items". Each draft is an unpublished Story owned by
