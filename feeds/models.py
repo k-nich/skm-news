@@ -4,7 +4,7 @@ from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
 
-from .validators import validate_public_url
+from .validators import normalise_feed_url, validate_public_url
 
 # A failing feed waits interval x 2^failures before the next attempt, capped here.
 MAX_BACKOFF = timedelta(hours=24)
@@ -64,6 +64,11 @@ class Feed(models.Model):
 
     def __str__(self):
         return self.name
+
+    def clean(self):
+        super().clean()
+        if self.url:  # so trivial variants can't add the same feed twice
+            self.url = normalise_feed_url(self.url)
 
     def next_due_at(self):
         """When this feed may next be fetched (None = never fetched, due now)."""

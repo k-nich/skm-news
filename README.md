@@ -102,13 +102,16 @@ Public news feeds are pulled into a read-only **wire** in the admin
   failure. Postgres statements time out after 60s, and the process kills
   itself 120s after the cap, so a run always ends.
 - Only fetches public addresses: private, loopback, link-local and internal
-  hosts are refused in the admin form and re-checked on every redirect hop.
+  hosts are refused in the admin form and re-checked on every redirect hop,
+  and each request connects to the address that was checked. URLs with
+  credentials or backslashes are refused.
 - Parses RSS 0.9x/1.0/2.0 and Atom (feedparser) into plain text with angle
   brackets neutralised, because the front page renders story text as HTML.
   Dates are stored in UTC (AU/NZ zone names handled); future dates are
   clamped to now, and missing or placeholder dates get the fetch time. One
-  unreadable entry is skipped without failing the feed; documents declaring
-  XML entities are refused.
+  unreadable entry is skipped without failing the feed. Documents declaring
+  XML entities, or in encodings where markup isn't plain ASCII (UTF-7,
+  EBCDIC), are refused; UTF-16/32 is converted first.
 - Dedupes by GUID within a feed and by normalised link across feeds, so a
   story carried by two feeds is stored once (keeping a section if either
   feed has one).

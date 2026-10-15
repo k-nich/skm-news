@@ -9,6 +9,7 @@ one is still active).
 from __future__ import annotations
 
 import calendar
+import codecs
 import hashlib
 import html
 import io
@@ -25,16 +26,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
-from xml.sax import SAXException
 
 import feedparser
 import requests
 from django.conf import settings
-from django.core.exceptions import SuspiciousOperation
 from django.db import connection, transaction
 from django.db.models import F
 from django.utils import timezone
-from django.utils.html import strip_tags
+from requests.adapters import HTTPAdapter
+from urllib3.util import parse_url
 
 from .models import Feed, FeedItem
 
@@ -50,13 +50,15 @@ READ_TIMEOUT = 15  # seconds of silence before giving up
 MAX_BYTES = 4 * 1024 * 1024
 MAX_REDIRECTS = 5
 MAX_ENTRIES = 200  # per document; news feeds carry 10-100
+PARSE_BUDGET = 10  # seconds of normalising per document
+PROCESS_GRACE = 60  # seconds after the download deadline to finish storing
 
 TITLE_MAX = 500
 SUMMARY_MAX = 2000
 AUTHOR_MAX = 200
 LINK_MAX = 2000
 GUID_MAX = 2000
-RAW_TEXT_MAX = 20_000  # input cap per field before HTML stripping
+RAW_TEXT_MAX = 10_000  # input cap per field before HTML stripping
 EARLIEST = datetime(2000, 1, 1, tzinfo=dt_timezone.utc)  # older = placeholder date
 
 LOCK_KEY = 0x534B4D46  # Postgres advisory lock id for ingest runs
@@ -68,13 +70,9 @@ _BLOCK_TAG = re.compile(
     r"<\s*/?\s*(?:p|br|div|li|ul|ol|h[1-6]|blockquote|tr|td|figure|figcaption)\b[^<>]*>",
     re.I,
 )
-_ANY_TAG = re.compile(r"<[^<>]*>")
+# Any other tag; '<' must open a name, '/', '!' or '?' so "a < b" stays text.
+_ANY_TAG = re.compile(r"<(?=[A-Za-z/!?])[^<>]*>")
 _CHAR_REF = re.compile(rb"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));")
-# feedparser's fallback parser expands entities without limit (memory bomb).
-_ENTITY_DECLS = tuple(
-    "<!ENTITY".encode(codec)
-    for codec in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
-)
 _TRACKING_PARAM = re.compile(
     r"^(utm_\w+|fbclid|gclid|dclid|mc_cid|mc_eid|ocid|cmpid|sr_share)$", re.I
 )
@@ -84,6 +82,22 @@ _LOCAL_ZONES = {
     "AWST": "+0800", "NZST": "+1200", "NZDT": "+1300",
 }
 _LOCAL_ZONE_SUFFIX = re.compile(r"\s(" + "|".join(_LOCAL_ZONES) + r")\s*$")
+# A complete document ends with its root's closing tag (then maybe comments).
+_ROOT_END = re.compile(
+    rb"</(?:[\w.-]+:)?(?:rss|feed|RDF)\s*>(?:\s|<!--.*?-->|<\?.*?\?>)*\Z", re.S
+)
+_XML_ENCODING = re.compile(rb"^\s*<\?xml[^>]*?\sencoding\s*=\s*([\"'])([A-Za-z0-9._:-]+)\1")
+_CHARSET = re.compile(r";\s*charset\s*=\s*[\"']?([A-Za-z0-9._:-]+)[\"']?", re.I)
+# Byte signatures of encodings where '<' isn't byte 0x3C. Order matters:
+# UTF-32 LE starts with the UTF-16 LE BOM.
+_WIDE_SIGNATURES = [
+    (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+    (b"\x00\x00\x00<", "utf-32-be"), (b"<\x00\x00\x00", "utf-32-le"),
+    (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+    (b"\x00<", "utf-16-be"), (b"<\x00", "utf-16-le"),
+]
+_EBCDIC_XML = b"\x4c\x6f\xa7\x94"  # "<?xm" in EBCDIC
+_PRINTABLE_ASCII = bytes(range(0x20, 0x7F))
 
 
 def retention_days():
@@ -121,20 +135,13 @@ def truncate(text, limit):
     return cut.rstrip(" ,;:-") + "…"
 
 
-def _strip_tags(text):
-    try:
-        return strip_tags(text)
-    except SuspiciousOperation:  # Django refuses pathological markup
-        return _ANY_TAG.sub(" ", text)
-
-
 def clean_text(value, limit):
-    """Feed HTML -> single-line plain text, safe to render as HTML."""
+    """Feed HTML -> single-line plain text, safe to render as HTML. Linear time."""
     if not value:
         return ""
     text = strip_controls(str(value)[:RAW_TEXT_MAX])
     for _ in range(4):  # markup can arrive entity-escaped more than once
-        cleaned = html.unescape(_strip_tags(_BLOCK_TAG.sub(" ", text)))
+        cleaned = html.unescape(_ANY_TAG.sub("", _BLOCK_TAG.sub(" ", text)))
         if cleaned == text:
             break
         text = cleaned
@@ -174,21 +181,66 @@ def _address_allowed(address):
     return address.is_global
 
 
-def check_url(url):
-    """Raise FetchError unless `url` is http(s) and its host resolves only to public addresses."""
-    parts = urlsplit(url)
-    host = (parts.hostname or "").rstrip(".")
-    if parts.scheme not in ("http", "https") or not host:
-        raise FetchError(f"Not an http(s) URL: {url[:200]}")
+def _resolve(host, port):
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return [info[4][0].split("%", 1)[0] for info in infos]
+
+
+def _target(url):
+    """(host, port) exactly as requests/urllib3 will connect to them."""
+    if "\\" in url:
+        raise FetchError("Blocked: backslash in URL")
     try:
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError, ValueError) as exc:
+        parsed = parse_url(url)
+    except ValueError as exc:
+        raise FetchError(f"Bad URL: {exc}") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.host:
+        raise FetchError(f"Not an http(s) URL: {url[:200]}")
+    if parsed.auth:
+        raise FetchError("Blocked: credentials in URL")
+    host = parsed.host.strip("[]").rstrip(".").lower()
+    # Refuse URLs that another parser would read differently.
+    if (urlsplit(url).hostname or "").rstrip(".") != host:
+        raise FetchError("Blocked: ambiguous URL")
+    return host, parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
+def check_url(url):
+    """Return (host, address) to connect to, or raise FetchError.
+
+    Every address the host resolves to must be public; the request is then
+    pinned to the address checked here, so a second DNS answer can't redirect it.
+    """
+    host, port = _target(url)
+    try:
+        addresses = _resolve(host, port)
+    except (OSError, UnicodeError) as exc:
         raise FetchError(f"Can't resolve {host}: {exc}") from exc
-    for info in infos:
-        address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
-        if not _address_allowed(address):
+    if not addresses:
+        raise FetchError(f"Can't resolve {host}")
+    for address in addresses:
+        if not _address_allowed(ipaddress.ip_address(address)):
             raise FetchError(f"Blocked: {host} resolves to non-public address {address}")
+    return host, addresses[0]
+
+
+class _PinnedAdapter(HTTPAdapter):
+    """Connect to an already-vetted IP while keeping the hostname for Host/SNI/TLS checks."""
+
+    def __init__(self, host, address):
+        self._host, self._address = host, address
+        super().__init__(max_retries=0)
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        if host_params["host"].strip("[]").rstrip(".").lower() != self._host:
+            raise FetchError("Blocked: request host changed after the check")
+        host_params = {**host_params, "host": self._address}
+        if host_params["scheme"] == "https":
+            pool_kwargs = {**pool_kwargs, "server_hostname": self._host, "assert_hostname": self._host}
+        return host_params, pool_kwargs
 
 
 @dataclass(frozen=True)
@@ -225,41 +277,28 @@ def fetch(req):
         headers["If-Modified-Since"] = req.last_modified
     url = req.url
     try:
-        # Redirects are followed by hand so every hop passes check_url.
+        # Redirects are followed by hand so every hop is checked and pinned.
         for _ in range(MAX_REDIRECTS + 1):
-            check_url(url)
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                stream=True,
-                allow_redirects=False,
-            )
-            if not resp.is_redirect:
-                break
-            resp.close()
-            url = urljoin(url, resp.headers["Location"])
-        else:
-            raise FetchError(f"More than {MAX_REDIRECTS} redirects")
-        with resp:
-            result.status = resp.status_code
-            result.final_url = url
-            result.etag = _header(resp, "ETag", 255)
-            result.last_modified = _header(resp, "Last-Modified", 64)
-            result.content_type = _header(resp, "Content-Type", 200)
-            if resp.status_code == 304:
-                return result
-            if resp.status_code >= 400:
-                result.error = f"HTTP {resp.status_code}"
-                return result
-            body, size = [], 0
-            for chunk in resp.iter_content(64 * 1024):
-                size += len(chunk)
-                if size > MAX_BYTES:
-                    result.error = f"Response over {MAX_BYTES // (1024 * 1024)} MB"
+            host, address = check_url(url)
+            with requests.Session() as session:
+                session.trust_env = False  # no env proxies or .netrc credentials
+                adapter = _PinnedAdapter(host, address)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                resp = session.get(
+                    url,
+                    headers={**headers, "Host": parse_url(url).netloc},
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                    stream=True,
+                    allow_redirects=False,
+                )
+                with resp:
+                    if resp.is_redirect:
+                        url = urljoin(url, resp.headers["Location"])
+                        continue
+                    _read(resp, url, result)
                     return result
-                body.append(chunk)
-            result.content = b"".join(body)
+        raise FetchError(f"More than {MAX_REDIRECTS} redirects")
     except FetchError as exc:
         result.error = str(exc)
     except requests.RequestException as exc:
@@ -268,6 +307,27 @@ def fetch(req):
         log.exception("Unexpected error fetching %s", req.url)
         result.error = _describe(exc)
     return result
+
+
+def _read(resp, url, result):
+    result.status = resp.status_code
+    result.final_url = url
+    result.etag = _header(resp, "ETag", 255)
+    result.last_modified = _header(resp, "Last-Modified", 64)
+    result.content_type = _header(resp, "Content-Type", 200)
+    if resp.status_code == 304:
+        return
+    if resp.status_code >= 400:
+        result.error = f"HTTP {resp.status_code}"
+        return
+    body, size = [], 0
+    for chunk in resp.iter_content(64 * 1024):
+        size += len(chunk)
+        if size > MAX_BYTES:
+            result.error = f"Response over {MAX_BYTES // (1024 * 1024)} MB"
+            return
+        body.append(chunk)
+    result.content = b"".join(body)
 
 
 def _fetch_all(reqs, *, workers, end, started):
@@ -317,12 +377,50 @@ class Entry:
     summary: str
     author: str
     published_at: datetime
+    has_id: bool = True
 
 
 @dataclass
 class Parsed:
     entries: list
-    well_formed: bool  # False if the XML broke off, e.g. a truncated download
+    complete: bool  # False if the document broke off or wasn't fully read
+
+
+def _ascii_compatible(codec):
+    """True if `codec` decodes ASCII bytes to themselves, so '<' can only come from b'<'.
+
+    Fails for UTF-7 (base64 runs can decode to '<'), EBCDIC and UTF-16/32.
+    """
+    try:
+        return _PRINTABLE_ASCII.decode(codec) == _PRINTABLE_ASCII.decode("ascii")
+    except LookupError:  # unknown to Python, so feedparser can't decode with it either
+        return True
+    except UnicodeError:
+        return False
+
+
+def _ascii_based(content, content_type):
+    """Return (content, content_type) in an encoding where markup is plain ASCII.
+
+    The entity and char-ref safeguards below work on bytes, so UTF-16/32 is
+    converted to UTF-8 and encodings like UTF-7 or EBCDIC are refused.
+    """
+    for signature, codec in _WIDE_SIGNATURES:
+        if content.startswith(signature):
+            text = content.decode(codec, errors="replace").lstrip("﻿")
+            text = re.sub(
+                r"^(\s*<\?xml[^>]*?)\s+encoding\s*=\s*([\"'])[^\"']*\2", r"\1", text, count=1
+            )
+            return text.encode("utf-8"), _CHARSET.sub("", content_type)
+    if content.startswith(_EBCDIC_XML):
+        raise ParseError("Unsupported character encoding (EBCDIC)")
+    match = _XML_ENCODING.match(content)
+    if match and not _ascii_compatible(match.group(2).decode()):
+        raise ParseError(f"Unsupported character encoding {match.group(2).decode()}")
+    charset = _CHARSET.search(content_type)
+    if charset and not _ascii_compatible(charset.group(1)):
+        content_type = _CHARSET.sub("", content_type)  # contradicts the bytes; ignore it
+    return content, content_type
 
 
 def _fix_char_refs(content):
@@ -344,8 +442,10 @@ def parse(content, *, base_url="", content_type="", now=None):
     now = now or timezone.now()
     if not content or not content.strip():
         raise ParseError("Empty response")
-    if any(decl in content for decl in _ENTITY_DECLS):
+    content, content_type = _ascii_based(content, content_type)
+    if b"<!ENTITY" in content:  # feedparser's fallback parser expands entities without limit
         raise ParseError("Document declares XML entities")
+    complete = bool(_ROOT_END.search(content[-65536:]))
     # No content-location: feedparser would turn bare GUIDs into URLs under the
     # feed's own address. Relative links are resolved in _entry_link instead.
     headers = {"content-type": content_type} if content_type else {}
@@ -355,15 +455,18 @@ def parse(content, *, base_url="", content_type="", now=None):
         parsed = feedparser.parse(io.BytesIO(_fix_char_refs(content)), response_headers=headers)
     except Exception as exc:
         raise ParseError(_describe(exc)) from exc
-    well_formed = not (parsed.get("bozo") and isinstance(parsed.get("bozo_exception"), SAXException))
     if not parsed.entries:
         if parsed.get("version"):  # a recognised feed that currently has no items
-            return Parsed([], well_formed)
+            return Parsed([], complete)
         if parsed.get("bozo"):
             raise ParseError(_describe(parsed.bozo_exception))
         raise ParseError("Not an RSS or Atom document")
-    entries = []
+    entries, started = [], time.monotonic()
     for raw in parsed.entries[:MAX_ENTRIES]:
+        if time.monotonic() - started > PARSE_BUDGET:
+            log.warning("Stopped reading %s after %ss", base_url, PARSE_BUDGET)
+            complete = False
+            break
         try:
             entry = _normalise(raw, now, base_url)
         except Exception:  # one bad entry must not sink the feed
@@ -371,7 +474,7 @@ def parse(content, *, base_url="", content_type="", now=None):
             continue
         if entry is not None:
             entries.append(entry)
-    return Parsed(entries, well_formed)
+    return Parsed(entries, complete)
 
 
 def _normalise(raw, now, base_url):
@@ -385,14 +488,14 @@ def _normalise(raw, now, base_url):
     if not title:
         return None
     guid = strip_controls(str(raw.get("id") or "").strip())
-    guid = guid or link or "hash:" + sha256(f"{title}\n{summary}")
     return Entry(
-        guid=guid,
+        guid=guid or link or "hash:" + sha256(f"{title}\n{summary}"),
         link=link,
         title=title,
         summary=summary,
         author=clean_text(raw.get("author"), AUTHOR_MAX),
         published_at=_entry_datetime(raw, now),
+        has_id=bool(guid),
     )
 
 
@@ -448,6 +551,17 @@ def _local_zone_datetime(value):
 # --- storing ----------------------------------------------------------------
 
 
+def _identity(entry, links_per_guid, link_counts):
+    """What makes an entry unique within its feed."""
+    if not entry.has_id and entry.link and link_counts[entry.link] > 1:
+        # No GUID and a shared link (e.g. live-blog updates): use the content.
+        return f"{entry.link}\n{entry.title}\n{entry.summary}"
+    if len(links_per_guid[entry.guid]) > 1:
+        # A GUID reused for different links identifies none of them alone.
+        return f"{entry.guid}\n{entry.link}"
+    return entry.guid
+
+
 def store_entries(feed, entries, *, now):
     """Insert entries not yet on the wire and refresh last_seen_at on the rest.
 
@@ -457,17 +571,14 @@ def store_entries(feed, entries, *, now):
     links_per_guid = defaultdict(set)
     for entry in entries:
         links_per_guid[entry.guid].add(entry.link)
+    link_counts = Counter(e.link for e in entries if e.link)
     key_counts = Counter(link_key(e.link) for e in entries if e.link)
 
     batch = {}
     for entry in entries:
         if entry.published_at < cutoff:  # never let expired entries in
             continue
-        # A GUID reused for different links identifies none of them alone.
-        identity = entry.guid
-        if len(links_per_guid[entry.guid]) > 1:
-            identity = f"{entry.guid}\n{entry.link}"
-        batch.setdefault(sha256(identity), entry)
+        batch.setdefault(sha256(_identity(entry, links_per_guid, link_counts)), entry)
     if not batch:
         return 0
 
@@ -607,8 +718,8 @@ def process(feed, result, *, now):
             )
         except ParseError as exc:
             raise _FeedFailed(f"Parse error: {exc}") from exc
-        if not parsed.well_formed:
-            # Possibly truncated: keep what parsed, but force a full download next time.
+        if not parsed.complete:
+            # Truncated or cut short: keep what parsed, but download in full next time.
             result.etag = result.last_modified = ""
         with transaction.atomic():
             new = store_entries(feed, parsed.entries, now=now)
@@ -638,22 +749,39 @@ _SESSION_SETTINGS = [
 ]
 
 
+class _RunSession:
+    """The database session holding the run lock and its timeouts."""
+
+    def __init__(self):
+        self.acquired = False
+        self._raw = None
+
+    def intact(self):
+        """False once Django has replaced the connection (lock and settings are gone)."""
+        if connection.vendor != "postgresql":
+            return True
+        return connection.connection is not None and connection.connection is self._raw
+
+
 @contextmanager
 def _run_session():
-    """Take the one-run-at-a-time lock; yield whether it was acquired."""
+    """Take the one-run-at-a-time lock and set statement limits."""
+    session = _RunSession()
     if connection.vendor != "postgresql":
-        yield True
+        session.acquired = True
+        yield session
         return
     with connection.cursor() as cursor:
         cursor.execute("SELECT pg_try_advisory_lock(%s)", [LOCK_KEY])
-        acquired = cursor.fetchone()[0]
-        if acquired:
+        session.acquired = cursor.fetchone()[0]
+        if session.acquired:
             for name, value in _SESSION_SETTINGS:
                 cursor.execute("SELECT set_config(%s, %s, false)", [name, value])
+    session._raw = connection.connection
     try:
-        yield acquired
+        yield session
     finally:
-        if acquired:
+        if session.acquired and session.intact():
             try:
                 with connection.cursor() as cursor:
                     for name, _ in _SESSION_SETTINGS:
@@ -675,6 +803,7 @@ class RunReport:
     feeds: list = field(default_factory=list)
     pruned: int = 0
     locked_out: bool = False
+    aborted: bool = False  # lost the database session mid-run
 
     @property
     def new(self):
@@ -691,8 +820,8 @@ class RunReport:
 
 def run(feeds=None, *, force=False, workers=8, deadline=240, prune=True):
     """Fetch `feeds` (default: active feeds that are due) and store new items."""
-    with _run_session() as acquired:
-        if not acquired:
+    with _run_session() as session:
+        if not session.acquired:
             return RunReport(locked_out=True)
         now = timezone.now()
         if feeds is None:
@@ -706,14 +835,23 @@ def run(feeds=None, *, force=False, workers=8, deadline=240, prune=True):
         reqs = [FetchRequest(f.pk, f.url, f.etag, f.last_modified) for f in feeds]
         started = set()
         end = time.monotonic() + deadline
+        stopped_early = False
         for result in _fetch_all(reqs, workers=workers, end=end, started=started):
+            if not session.intact():
+                # Django reconnected without our lock or limits: stop here.
+                log.error("Lost the database session mid-run; stopping")
+                report.aborted = stopped_early = True
+                break
+            if time.monotonic() > end + PROCESS_GRACE:
+                stopped_early = True  # leave the rest due for the next run
+                break
             report.feeds.append(process(pending.pop(result.feed_id), result, now=now))
         for feed in pending.values():
-            if feed.pk in started:
+            if feed.pk in started and not stopped_early:
                 late = FetchResult(feed_id=feed.pk, error=f"No response within the {deadline}s run deadline")
                 report.feeds.append(process(feed, late, now=now))
-            else:  # never reached: stays due for the next run, no penalty
+            else:  # never reached, or not processed in time: stays due, no penalty
                 report.feeds.append(FeedReport(feed, FeedReport.SKIPPED))
-        if prune:
+        if prune and not report.aborted:
             report.pruned = prune_items(now)
         return report

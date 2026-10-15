@@ -81,6 +81,8 @@ class Command(BaseCommand):
             f"{len(report.failures)} failed, {len(report.skipped)} skipped, "
             f"{report.pruned} pruned in {time.monotonic() - started:.1f}s."
         )
+        if report.aborted:
+            raise CommandError(f"Lost the database session mid-run; stopped early. {summary}")
         attempted = len(report.feeds) - len(report.skipped)
         if attempted and len(report.failures) == attempted:
             raise CommandError(f"All feeds failed. {summary}")

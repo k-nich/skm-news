@@ -108,8 +108,11 @@ class ParseTests(SimpleTestCase):
         self.assertNotIn("<", entry.title + entry.summary)
         self.assertTrue(entry.title.endswith("Hi"))
 
+    def test_angle_brackets_in_plain_text_survive_as_text(self):
+        self.assertEqual(clean_text("a < b and c > d", 100), "a ‹ b and c › d")
+
     def test_pathological_markup_is_handled(self):
-        for value in ("<" * 60 + "b>" * 60 + "x", "<p" * 10000):
+        for value in ("<" * 60 + "b>" * 60 + "x", "<p" * 10000, "<<b>" * 5000):
             with self.subTest(length=len(value)):
                 started = time.monotonic()
                 self.assertNotIn("<", clean_text(value, 2000))
@@ -138,6 +141,19 @@ class ParseTests(SimpleTestCase):
         utf16 = doc.decode("utf-8").replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16")
         with self.assertRaisesMessage(ParseError, "declares XML entities"):
             parse(utf16)
+        utf7 = doc.replace(b'encoding="UTF-8"', b'encoding="UTF-7"').replace(b"<!ENTITY", b"+ADw-!ENTITY")
+        with self.assertRaisesMessage(ParseError, "Unsupported character encoding"):
+            parse(utf7)
+
+    def test_wide_and_non_ascii_encodings(self):
+        doc = rss([{"title": "Emoji &#55357;&#56832; ok", "link": "https://e.com/1"}])
+        utf16 = doc.decode("utf-8").replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16")
+        self.assertEqual([e.link for e in entries(utf16)], ["https://e.com/1"])
+        ebcdic = '<?xml version="1.0" encoding="cp037"?><rss/>'.encode("cp037")
+        with self.assertRaisesMessage(ParseError, "Unsupported character encoding"):
+            parse(ebcdic)
+        # A charset header that contradicts the bytes is ignored.
+        self.assertEqual(len(entries(doc, content_type="text/xml; charset=utf-16")), 1)
 
     def test_links_resolve_against_the_feed_but_guids_stay_bare(self):
         doc = rss([
@@ -189,8 +205,11 @@ class ParseTests(SimpleTestCase):
         doc = rss([{"title": f"Item {i}", "link": f"https://e.com/{i}", "guid": str(i)} for i in range(3)])
         parsed = parse(doc[: doc.index(b"<item><title>Item 2") + 20], now=NOW)
         self.assertEqual([e.title for e in parsed.entries][:2], ["Item 0", "Item 1"])
-        self.assertFalse(parsed.well_formed)
-        self.assertTrue(parse(doc, content_type="text/html", now=NOW).well_formed)
+        self.assertFalse(parsed.complete)
+        self.assertTrue(parse(doc, content_type="text/html", now=NOW).complete)
+        sloppy = rss([{"title": "Q&A", "link": "https://e.com/qa"}]) + b"\n<!-- cached -->\n"
+        parsed = parse(sloppy, now=NOW)  # bare '&' makes it malformed, not truncated
+        self.assertEqual((len(parsed.entries), parsed.complete), (1, True))
 
     def test_rejects_html_and_empty_bodies(self):
         page = b"<!doctype html><html><head><title>Hi</title></head><body><p>x</p></body></html>"
@@ -426,6 +445,60 @@ class IngestTests(ServerTestCase):
         self.assertIn("127.0.0.2", report.failures[0].error)
         self.assertNotIn("/secret", [path for path, _ in self.server.requests[-1:]])
 
+    def test_url_tricks_are_refused(self):
+        port = self.server.httpd.server_address[1]
+        with mock.patch.object(ingest, "_address_allowed", REAL_ADDRESS_POLICY):
+            for url, error in (
+                (f"http://127.0.0.1:{port}\\@93.184.216.34/a", "Blocked: backslash"),
+                (f"http://user:pw@127.0.0.1:{port}/a", "Blocked: credentials"),
+                ("ftp://example.org/feed", "Not an http(s) URL"),
+            ):
+                with self.subTest(url=url):
+                    result = ingest.fetch(ingest.FetchRequest(1, url))
+                    self.assertTrue(result.error.startswith(error), result.error)
+        self.assertEqual(self.server.requests, [])
+
+    def test_connection_goes_to_the_checked_address(self):
+        port = self.server.httpd.server_address[1]
+        self.server.routes["/a"] = {"body": rss(self.items(1))}
+        with mock.patch.object(ingest, "_resolve", lambda host, port: ["127.0.0.1"]):
+            result = ingest.fetch(ingest.FetchRequest(1, f"http://pinned.test:{port}/a"))
+        self.assertEqual((result.error, result.status), ("", 200))
+        self.assertEqual(self.server.requests[-1][1]["Host"], f"pinned.test:{port}")
+
+    def test_sloppy_feed_keeps_conditional_get(self):
+        feed = self.make_feed("/a", rss([{"title": "Q&A", "link": "https://e.com/qa"}]), etag='"v1"')
+        run(force=True)
+        feed.refresh_from_db()
+        self.assertEqual(feed.etag, '"v1"')
+        self.assertEqual(run(force=True).feeds[0].status, Feed.STATUS_NOT_MODIFIED)
+
+    def test_guidless_updates_sharing_a_link_are_kept(self):
+        updates = [{"title": f"Update {i}", "link": "https://e.com/live", "pubDate": ago(minutes=i)}
+                   for i in range(3)]
+        self.make_feed("/a", rss(updates))
+        self.assertEqual(run(force=True).new, 3)
+        self.assertEqual(run(force=True).new, 0)
+
+    @skipUnless(connection.vendor == "postgresql", "session checks are Postgres-only")
+    def test_lost_database_session_stops_the_run(self):
+        self.make_feed("/a", rss(self.items(1)))
+        self.make_feed("/b", rss(self.items(1, prefix="https://b.example/")))
+
+        def release():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock_all()")
+                cursor.execute("RESET ALL")
+
+        self.addCleanup(release)
+        with mock.patch.object(ingest._RunSession, "intact", side_effect=[True, False, False]):
+            report = run(force=True)
+        self.assertTrue(report.aborted)
+        self.assertEqual(sorted(r.status for r in report.feeds), ["ok", "skipped"])
+        with self.assertRaisesMessage(CommandError, "Lost the database session"):
+            with mock.patch.object(ingest._RunSession, "intact", side_effect=[False, False, False]):
+                call_command("ingest_feeds", "--force", stdout=StringIO())
+
     def test_run_deadline_abandons_slow_feeds(self):
         self.make_feed("/slow", rss(self.items(1)), delay=3)
         self.make_feed("/fast", rss(self.items(1, prefix="https://fast.example/")))
@@ -644,13 +717,27 @@ class AdminTests(ServerTestCase):
 
     def test_feed_form_rejects_private_addresses(self):
         self.user("boss", "Admin")
-        for url in ("http://169.254.169.254/latest", "http://localhost/feed",
-                    "http://postgres.railway.internal/", "http://[::1]/feed"):
+        for url, message in (
+            ("http://169.254.169.254/latest", "Use a public feed address"),
+            ("http://localhost/feed", "Use a public feed address"),
+            ("http://postgres.railway.internal/", "Use a public feed address"),
+            ("http://[::1]/feed", "Use a public feed address"),
+            ("http://127.0.0.1:80\\@example.org/", "no backslashes"),
+            ("http://user:pw@example.org/feed", "without credentials"),
+        ):
             with self.subTest(url=url):
                 response = self.client.post(reverse("admin:feeds_feed_add"), self.form(url=url))
                 self.assertEqual(response.status_code, 200)
-                self.assertContains(response, "Use a public feed address")
+                self.assertContains(response, message)
         self.assertFalse(Feed.objects.filter(name="Feed").exists())
+
+    def test_feed_urls_are_normalised_before_the_duplicate_check(self):
+        self.user("boss", "Admin")
+        add = reverse("admin:feeds_feed_add")
+        self.assertEqual(self.client.post(add, self.form(url="HTTPS://Example.ORG/rss.xml#top")).status_code, 302)
+        self.assertTrue(Feed.objects.filter(url="https://example.org/rss.xml").exists())
+        response = self.client.post(add, self.form(name="Again", url="https://example.org/rss.xml?"))
+        self.assertContains(response, "already exists")
 
     def test_changing_a_feed_url_resets_its_fetch_state(self):
         Feed.objects.filter(pk=self.feed.pk).update(
