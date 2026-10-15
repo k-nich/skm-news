@@ -26,8 +26,9 @@ automatically (DEBUG is on by default).
    - `DATABASE_URL`       = reference the Postgres service: `${{Postgres.DATABASE_URL}}`
    (Railway also injects `RAILWAY_PUBLIC_DOMAIN`, which settings.py reads
    automatically for ALLOWED_HOSTS and CSRF.)
-5. Deploy. On boot the Procfile runs migrations, collects static files,
-   then starts Gunicorn.
+5. Deploy. On boot the Procfile runs migrations, syncs the role groups,
+   collects static files, then starts Gunicorn. The service's Root Directory
+   setting must be blank (the repo root).
 6. Create your admin login from the Railway shell (or `railway run`):
    `python manage.py createsuperuser`
 
@@ -35,8 +36,9 @@ The front page is at `/`, the Django admin at `/admin/`.
 
 ## What each production file does
 
-- `Procfile`         - start command: migrate, collectstatic, then Gunicorn.
-- `requirements.txt` - adds gunicorn, psycopg (Postgres), whitenoise, dj-database-url.
+- `Procfile`         - start command: migrate, setup_roles, collectstatic, then Gunicorn.
+- `requirements.txt` - adds gunicorn, psycopg (Postgres), whitenoise, dj-database-url,
+                       feedparser and requests (RSS wire).
 - `.python-version`  - pins Python 3.12 for reproducible builds.
 - `.env.example`     - the variables to set (never commit a real `.env`).
 - `settings.py`      - reads SECRET_KEY / DEBUG / hosts / DATABASE_URL from the
@@ -68,6 +70,78 @@ stories already exist.
 
 On Railway, edit the live edition by opening `/admin/` on your deployed URL
 (create a login with `python manage.py createsuperuser` via the Railway shell).
+
+## RSS wire (feeds app)
+
+Public news feeds are pulled into a read-only **wire** in the admin
+(*Wire (RSS feeds)*). Nothing from a feed is published automatically.
+
+- **Feeds** (Admin role): name, URL, default section, active flag and minimum
+  fetch interval. Health columns show last status, consecutive failures and
+  the next due time. "Fetch on the next scheduled run" clears a feed's wait
+  and backoff; changing a feed's URL does the same. Fetching only happens in
+  the cron service, never in a web request. Thirteen public-broadcaster feeds
+  (ABC, SBS, RNZ, NPR) are seeded by `feeds/migrations/0002_seed_feeds.py`,
+  mapped to sections by name.
+- **Feed items** (Journalist, Editor, Admin): filter by status, section or
+  feed, open the original, then select up to 25 items and run "Create draft
+  stories from selected items". Each draft is an unpublished Story owned by
+  the user, with the item's headline, section and first 2-3 summary sentences
+  as bullets; the story page links back to the original. Feed text is the
+  publisher's copy, so rewrite it before publishing. Items can't be edited or
+  deleted (the next fetch would bring them back).
+
+`python manage.py ingest_feeds` (`feeds/ingest.py`):
+
+- Fetches active feeds that are due: each feed's interval, doubled after each
+  consecutive failure (capped at 24h).
+- Downloads 8 feeds in parallel with ETag/Last-Modified conditional GETs.
+  Limits: 5s connect and 15s read timeouts, 4 MB and 200 entries per feed,
+  and a 240s cap per run. Downloads still going at the cap are abandoned
+  (they run in daemon threads); feeds not reached are left due without a
+  failure. Postgres statements time out after 60s, and the process kills
+  itself 120s after the cap, so a run always ends.
+- Only fetches public addresses: private, loopback, link-local and internal
+  hosts are refused in the admin form and re-checked on every redirect hop.
+- Parses RSS 0.9x/1.0/2.0 and Atom (feedparser) into plain text with angle
+  brackets neutralised, because the front page renders story text as HTML.
+  Dates are stored in UTC (AU/NZ zone names handled); future dates are
+  clamped to now, and missing or placeholder dates get the fetch time. One
+  unreadable entry is skipped without failing the feed; documents declaring
+  XML entities are refused.
+- Dedupes by GUID within a feed and by normalised link across feeds, so a
+  story carried by two feeds is stored once (keeping a section if either
+  feed has one).
+- Deletes undrafted items once no feed has listed them for
+  `FEEDS_RETENTION_DAYS` (default 14). Entries already older than that are
+  never added.
+- Takes a Postgres advisory lock so overlapping runs exit straight away.
+- Options: `--force` (ignore schedules), `--feed ID` (one feed), `--no-prune`,
+  `--workers N`, `--deadline SECONDS`. Exits 1 only when every attempted feed
+  failed.
+
+### Railway cron service
+
+Ingestion runs as a second Railway service built from this same repo:
+
+1. Project -> New -> GitHub Repo -> `k-nich/skm-news`. Name it `feeds-cron`;
+   don't give it a public domain.
+2. Settings -> Custom Start Command: `python manage.py ingest_feeds`
+3. Settings -> Cron Schedule: `*/15 * * * *` (UTC; runs must be at least
+   5 minutes apart).
+4. Variables:
+   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
+   - `DJANGO_SECRET_KEY` = `${{<web service name>.DJANGO_SECRET_KEY}}`
+   - `DJANGO_DEBUG` = `0`
+   - optional `FEEDS_RETENTION_DAYS`
+5. Check the first run's logs: one `OK`, `304`, `SKIP` or `FAIL` line per
+   feed, then a summary. Gunicorn output there means the custom start command
+   isn't applied.
+
+Railway skips a scheduled run while the previous one is still active and
+never stops a hung process; the limits above prevent that. To test a feed
+straight away, run `python manage.py ingest_feeds --feed ID` from the
+`feeds-cron` service's shell.
 
 ## Custom domain: skm.news (registered at GoDaddy)
 

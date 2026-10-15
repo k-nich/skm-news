@@ -1,4 +1,7 @@
+from urllib.parse import urlsplit
+
 from django.contrib import admin
+from django.utils.html import format_html
 
 from .models import Section, Story
 
@@ -61,8 +64,27 @@ class StoryAdmin(admin.ModelAdmin):
             return True
         return obj.author_id == request.user.id and not obj.locked
 
+    # --- wire source (stories drafted from an RSS item) -----------------
+    def get_fieldsets(self, request, obj=None):
+        fieldsets = list(super().get_fieldsets(request, obj))
+        if obj is not None and getattr(obj, "feed_item", None) is not None:
+            fieldsets.append(("Source", {"fields": ("source_link",)}))
+        return fieldsets
+
+    @admin.display(description="Original article")
+    def source_link(self, obj):
+        item = getattr(obj, "feed_item", None)
+        if item is None or not item.link:
+            return "-"
+        source = item.feed.name if item.feed_id else urlsplit(item.link).hostname
+        return format_html(
+            '<a href="{}" target="_blank" rel="noopener noreferrer">{} ↗</a>',
+            item.link, source,
+        )
+
     def get_readonly_fields(self, request, obj=None):
         ro = list(super().get_readonly_fields(request, obj))
+        ro.append("source_link")
         # Journalists can't reassign authorship...
         if not self.can_edit_any(request.user) and "author" not in ro:
             ro.append("author")

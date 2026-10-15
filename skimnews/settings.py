@@ -59,7 +59,12 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "news",
+    "feeds",
 ]
+
+# RSS wire: items older than this that were never drafted into a story are
+# deleted at the end of each ingest run.
+FEEDS_RETENTION_DAYS = int(os.environ.get("FEEDS_RETENTION_DAYS", "14"))
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
