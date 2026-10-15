@@ -18,6 +18,9 @@ ROLE_PERMISSIONS = {
         "news.add_section", "news.change_section", "news.delete_section", "news.view_section",
         "news.add_story", "news.change_story", "news.delete_story", "news.view_story",
         "news.edit_any_story", "news.lock_story",
+        # RSS sources (add/edit/remove feeds) and the wire.
+        "feeds.add_feed", "feeds.change_feed", "feeds.delete_feed", "feeds.view_feed",
+        "feeds.view_feeditem",
         # ...and the ability to manage other accounts.
         "auth.add_user", "auth.change_user", "auth.delete_user", "auth.view_user",
         "auth.add_group", "auth.change_group", "auth.delete_group", "auth.view_group",
@@ -27,12 +30,16 @@ ROLE_PERMISSIONS = {
         "news.add_story", "news.change_story", "news.view_story",
         "news.edit_any_story", "news.lock_story",
         "news.view_section",
+        # See feed health; read the wire and draft stories from it.
+        "feeds.view_feed", "feeds.view_feeditem",
     ],
     "Journalist": [
         # Write and edit only their OWN stories (enforced in the admin);
         # see sections but don't restructure them. No lock, no edit-any.
         "news.add_story", "news.change_story", "news.view_story",
         "news.view_section",
+        # Read the wire and draft stories from it.
+        "feeds.view_feeditem",
     ],
     # Readers need no admin permissions — the site is publicly readable.
     # The group is a forward-looking label for future reader-only features.

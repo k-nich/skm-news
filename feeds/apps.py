@@ -1,6 +1,7 @@
 from django.apps import AppConfig
 
 
-class NewsConfig(AppConfig):
+class FeedsConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
-    name = "news"
+    name = "feeds"
+    verbose_name = "Wire (RSS feeds)"

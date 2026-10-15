@@ -30,16 +30,26 @@ if not SECRET_KEY:
         raise RuntimeError("DJANGO_SECRET_KEY must be set when DEBUG is off.")
 
 # Hosts: start from any explicitly listed, then add Railway's public domain.
+# Hosts come from DJANGO_ALLOWED_HOSTS (comma-separated). For the live site set
+# it to your custom domain(s), e.g. "skm.news,www.skm.news".
 ALLOWED_HOSTS = [
     h.strip()
     for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
     if h.strip()
 ]
-CSRF_TRUSTED_ORIGINS = []
+
+# Railway injects its own public domain; include it automatically so the
+# *.up.railway.app URL keeps working alongside your custom domain.
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
-if RAILWAY_DOMAIN:
+if RAILWAY_DOMAIN and RAILWAY_DOMAIN not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append(RAILWAY_DOMAIN)
-    CSRF_TRUSTED_ORIGINS.append(f"https://{RAILWAY_DOMAIN}")
+
+# CSRF needs the full https origin for each real (non-local) host. Django
+# requires this for admin logins and any POST over HTTPS, so we derive it
+# from ALLOWED_HOSTS rather than maintaining a second list by hand.
+CSRF_TRUSTED_ORIGINS = [
+    f"https://{h}" for h in ALLOWED_HOSTS if h not in ("localhost", "127.0.0.1")
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -49,7 +59,12 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "news",
+    "feeds",
 ]
+
+# RSS wire: items older than this that were never drafted into a story are
+# deleted at the end of each ingest run.
+FEEDS_RETENTION_DAYS = int(os.environ.get("FEEDS_RETENTION_DAYS", "14"))
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

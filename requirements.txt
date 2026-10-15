@@ -3,3 +3,5 @@ gunicorn>=23.0
 psycopg[binary]>=3.2
 whitenoise>=6.8
 dj-database-url>=2.3
+feedparser>=6.0.11,<7
+requests>=2.32,<3

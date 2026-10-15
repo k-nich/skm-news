@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -37,6 +38,14 @@ class Story(models.Model):
         related_name="stories",
         help_text="Required for section stories; leave blank for lead stories.",
     )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stories",
+        help_text="Who wrote this. Set automatically to the creator if left blank.",
+    )
     kicker = models.CharField(
         max_length=60, blank=True, help_text="Small label above the headline, e.g. MARKETS."
     )
@@ -53,6 +62,11 @@ class Story(models.Model):
     published = models.BooleanField(
         default=True, help_text="Uncheck to hide from the page without deleting."
     )
+    locked = models.BooleanField(
+        default=False,
+        help_text="When locked, the author can no longer edit. Only Editors and "
+        "Admins can lock or unlock.",
+    )
     order = models.PositiveIntegerField(
         default=0, help_text="Lower numbers appear first within the placement/section."
     )
@@ -62,6 +76,10 @@ class Story(models.Model):
     class Meta:
         ordering = ["order", "-created"]
         verbose_name_plural = "stories"
+        permissions = [
+            ("edit_any_story", "Can edit stories authored by others"),
+            ("lock_story", "Can lock or unlock a story for editing"),
+        ]
 
     def __str__(self):
         return self.headline
